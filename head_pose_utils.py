@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import math
 
-# [1] 정면용: 3D 얼굴 각도 (PnP)
+# [1] 정면용 (PnP) - 그대로
 def get_head_pose(image, landmarks):
     h, w, _ = image.shape
     face_3d = np.array([
@@ -23,7 +23,7 @@ def get_head_pose(image, landmarks):
     angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
     return angles[0] * 360, angles[1] * 360
 
-# [2] 옆/뒤용: 목 꺾임 각도
+# [2] 옆/뒤용 (Neck) - 그대로
 def get_neck_angle(landmarks, w, h):
     l_vis, r_vis = landmarks[7].visibility, landmarks[8].visibility
     if l_vis > r_vis:
@@ -36,40 +36,50 @@ def get_neck_angle(landmarks, w, h):
     delta_y = ear[1] - shoulder[1]
     return abs(math.degrees(math.atan2(delta_y, delta_x)))
 
-# [3] 아래쪽용: 코 vs 귀 높이 역전 (Nose-Ear)
-def check_low_angle_status(landmarks, w, h):
-    # Pose 랜드마크 기준: 코(0), 왼귀(7), 오른귀(8) -> (MediaPipe 버전에 따라 0이 코임)
+# [3] 아래쪽용 (Low Angle) - 그대로
+def check_low_angle_score(landmarks, w, h):
+    # 코(0)와 귀(7,8)의 Y좌표 차이 계산
     nose_y = landmarks[0].y * h 
     ear_y = min(landmarks[7].y * h, landmarks[8].y * h)
-    return nose_y - ear_y # 양수면 코가 아래(숙임)
+    return nose_y - ear_y # 값이 클수록 코가 아래에 있는 것
 
-# [4] 위쪽용: 턱 vs 어깨 거리 (Chin-Shoulder)
+# [4] 위쪽용 (High Angle) - 그대로
 def get_chin_shoulder_distance(face_landmarks, pose_landmarks, w, h):
-    # FaceMesh 턱 끝: 152번
     chin = face_landmarks[152]
     chin_coords = np.array([chin.x * w, chin.y * h])
-    
-    # Pose 어깨 중간점
     l_sh = pose_landmarks[11]
     r_sh = pose_landmarks[12]
     shoulder_center = np.array([(l_sh.x + r_sh.x)*w/2, (l_sh.y + r_sh.y)*h/2])
-    
-    # 거리 계산
     distance = np.linalg.norm(chin_coords - shoulder_center)
-    
-    # 정규화 (사람이 멀리 있을 수도 있으니까 어깨 너비로 나눔)
     shoulder_width = abs(l_sh.x - r_sh.x) * w
     if shoulder_width == 0: return 0
-    
-    # 어깨 너비 대비 턱 거리가 얼마나 가까운가? (작을수록 숙인 것)
-    ratio = distance / shoulder_width
-    return ratio
+    return distance / shoulder_width
 
-# [보정 함수] 현재 상태를 기준값으로 저장
+# [5] 손 그립 체크 - 그대로
+def is_hand_holding_phone(landmarks, img_w, img_h, box, margin=100):
+    x1, y1, x2, y2 = box
+    hand_points = [15, 16, 17, 18, 19, 20, 21, 22]
+    hits = 0
+    thumb_pos = None
+    index_pos = None
+    for idx in hand_points:
+        lx = int(landmarks[idx].x * img_w)
+        ly = int(landmarks[idx].y * img_h)
+        if (x1 - margin < lx < x2 + margin) and (y1 - margin < ly < y2 + margin):
+            hits += 1
+            if idx == 21 or idx == 22: thumb_pos = np.array([lx, ly])
+            if idx == 19 or idx == 20: index_pos = np.array([lx, ly])
+    if hits < 2: return False
+    if thumb_pos is not None and index_pos is not None:
+        if np.linalg.norm(thumb_pos - index_pos) < 30: return False 
+    return True
+
+# 🌟 [수정] 보정 함수: 로우 앵글 값(nose_diff)도 저장하도록 변경!
 def calibrate_current(frame, face_results, pose_results):
     pitch = 0
     neck_angle = 90
     chin_ratio = 1.0
+    low_angle_score = 0 # 추가됨
     
     h, w, _ = frame.shape
     
@@ -81,29 +91,6 @@ def calibrate_current(frame, face_results, pose_results):
             
     if pose_results.pose_landmarks:
         neck_angle = get_neck_angle(pose_results.pose_landmarks.landmark, w, h)
+        low_angle_score = check_low_angle_score(pose_results.pose_landmarks.landmark, w, h)
         
-    return pitch, neck_angle, chin_ratio
-
-def calculate_brightness(image):
-    """
-    현재 화면의 평균 밝기를 계산 (0~255)
-    0에 가까울수록 암흑, 255에 가까울수록 눈뽕
-    """
-    # 이미지를 흑백(Grayscale)으로 변환해서 평균을 구함
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    avg_brightness = np.mean(gray)
-    return avg_brightness
-
-def apply_night_vision(image, gamma=1.5):
-    """
-    감마 보정(Gamma Correction)을 통해 어두운 곳을 밝게 만듦.
-    gamma > 1.0 : 밝아짐
-    gamma < 1.0 : 어두워짐
-    """
-    # 룩업 테이블(Look-Up Table) 생성 (계산 속도 100배 향상 기법)
-    inv_gamma = 1.0 / gamma
-    table = np.array([((i / 255.0) ** inv_gamma) * 255
-                      for i in np.arange(0, 256)]).astype("uint8")
-
-    # 이미지에 테이블 적용 (마법처럼 밝아짐!)
-    return cv2.LUT(image, table)
+    return pitch, neck_angle, chin_ratio, low_angle_score # 값 4개 리턴
