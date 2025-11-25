@@ -2,7 +2,34 @@ import cv2
 import numpy as np
 import math
 
-# [1] 정면용 (PnP) - 그대로
+# ==========================================
+# 1. 야간 모드 & 이미지 전처리
+# ==========================================
+def calculate_brightness(image):
+    if image is None: return 0
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return np.mean(gray)
+
+def apply_night_vision(image, gamma=1.5):
+    if image is None: return image
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+    return cv2.LUT(image, table)
+
+def apply_clahe(image):
+    if image is None: return image
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+# ==========================================
+# 2. 고개 숙임 감지 알고리즘
+# ==========================================
+
+# 🌟 [수정] 정면용 (PnP) - 각도 폭주 완벽 차단!
 def get_head_pose(image, landmarks):
     h, w, _ = image.shape
     face_3d = np.array([
@@ -18,12 +45,23 @@ def get_head_pose(image, landmarks):
     focal_length = 1 * w
     cam_matrix = np.array([[focal_length, 0, w/2], [0, focal_length, h/2], [0, 0, 1]])
     dist_matrix = np.zeros((4, 1), dtype=np.float64)
+    
     success, rot_vec, trans_vec = cv2.solvePnP(face_3d, face_2d, cam_matrix, dist_matrix)
     rmat, _ = cv2.Rodrigues(rot_vec)
     angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
-    return angles[0] * 360, angles[1] * 360
+    
+    # 원본 각도 (여기서 56000이 나옴)
+    x_raw = angles[0] * 360
+    y_raw = angles[1] * 360
+    
+    # 🌟 [핵심] 삼각함수를 이용한 강제 정규화 (-180 ~ 180)
+    # 어떤 미친 숫자가 들어와도 무조건 -180 ~ 180 사이로 변환됨
+    x = math.atan2(math.sin(x_raw * math.pi / 180), math.cos(x_raw * math.pi / 180)) * 180 / math.pi
+    y = math.atan2(math.sin(y_raw * math.pi / 180), math.cos(y_raw * math.pi / 180)) * 180 / math.pi
+    
+    return x, y
 
-# [2] 옆/뒤용 (Neck) - 그대로
+# [B] 옆/뒤용
 def get_neck_angle(landmarks, w, h):
     l_vis, r_vis = landmarks[7].visibility, landmarks[8].visibility
     if l_vis > r_vis:
@@ -36,14 +74,13 @@ def get_neck_angle(landmarks, w, h):
     delta_y = ear[1] - shoulder[1]
     return abs(math.degrees(math.atan2(delta_y, delta_x)))
 
-# [3] 아래쪽용 (Low Angle) - 그대로
+# [C] 아래쪽용
 def check_low_angle_score(landmarks, w, h):
-    # 코(0)와 귀(7,8)의 Y좌표 차이 계산
     nose_y = landmarks[0].y * h 
     ear_y = min(landmarks[7].y * h, landmarks[8].y * h)
-    return nose_y - ear_y # 값이 클수록 코가 아래에 있는 것
+    return nose_y - ear_y 
 
-# [4] 위쪽용 (High Angle) - 그대로
+# [D] 위쪽용
 def get_chin_shoulder_distance(face_landmarks, pose_landmarks, w, h):
     chin = face_landmarks[152]
     chin_coords = np.array([chin.x * w, chin.y * h])
@@ -55,7 +92,7 @@ def get_chin_shoulder_distance(face_landmarks, pose_landmarks, w, h):
     if shoulder_width == 0: return 0
     return distance / shoulder_width
 
-# [5] 손 그립 체크 - 그대로
+# [E] 손 그립 체크
 def is_hand_holding_phone(landmarks, img_w, img_h, box, margin=100):
     x1, y1, x2, y2 = box
     hand_points = [15, 16, 17, 18, 19, 20, 21, 22]
@@ -74,23 +111,19 @@ def is_hand_holding_phone(landmarks, img_w, img_h, box, margin=100):
         if np.linalg.norm(thumb_pos - index_pos) < 30: return False 
     return True
 
-# 🌟 [수정] 보정 함수: 로우 앵글 값(nose_diff)도 저장하도록 변경!
+# [보정 함수]
 def calibrate_current(frame, face_results, pose_results):
     pitch = 0
     neck_angle = 90
     chin_ratio = 1.0
-    low_angle_score = 0 # 추가됨
-    
+    low_angle_score = 0 
     h, w, _ = frame.shape
-    
     if face_results.multi_face_landmarks:
         for fl in face_results.multi_face_landmarks:
             pitch, _ = get_head_pose(frame, fl.landmark)
             if pose_results.pose_landmarks:
                 chin_ratio = get_chin_shoulder_distance(fl.landmark, pose_results.pose_landmarks.landmark, w, h)
-            
     if pose_results.pose_landmarks:
         neck_angle = get_neck_angle(pose_results.pose_landmarks.landmark, w, h)
         low_angle_score = check_low_angle_score(pose_results.pose_landmarks.landmark, w, h)
-        
-    return pitch, neck_angle, chin_ratio, low_angle_score # 값 4개 리턴
+    return pitch, neck_angle, chin_ratio, low_angle_score
