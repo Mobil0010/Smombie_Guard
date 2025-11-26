@@ -11,7 +11,7 @@ from collections import deque
 from ultralytics import YOLO
 import head_pose_utils as utils 
 
-print("🚀 스몸비 가드 (실시간 수치 모니터링 모드) 가동...")
+print("스몸비 가드 (하이브리드 보행 감지) 가동...")
 
 model = YOLO('yolov8n.pt') 
 target_classes = [0, 67, 73, 65, 77] 
@@ -28,8 +28,11 @@ pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 cap = cv2.VideoCapture(0)
 if not cap.isOpened(): exit()
 
-shoulder_history = deque(maxlen=20)
-WALKING_THRESHOLD = 0.02 
+# 🌟 [변수 추가] 보행 감지용 히스토리
+shoulder_history = deque(maxlen=20) # 상체용 (어깨 높이)
+ankle_history = deque(maxlen=20)    # 전신용 (발목 간격)
+
+WALKING_THRESHOLD_SHOULDER = 0.02 
 last_beep_time = 0
 
 base_pitch = 0 
@@ -37,12 +40,10 @@ base_neck = 90
 base_chin_dist = 0.5 
 base_low_angle = 0
 
-# 🌟 기준값 (이 값을 넘으면 빨간불!)
-THRESH_PITCH = 60      
+THRESH_PITCH = 50      
 THRESH_LOW_ANGLE = 38  
 THRESH_NECK = 40       
 
-# 스무딩 변수
 smooth_pitch = 0
 smooth_low = 0
 smooth_neck = 0
@@ -64,7 +65,7 @@ def is_hand_near_box(landmarks, img_w, img_h, box, margin=100):
             hits += 1
     return hits > 0
 
-print(f"✅ 감시 시작! (왼쪽의 수치를 확인하세요)")
+print(f"감시 시작")
 
 while True:
     ret, frame = cap.read()
@@ -72,7 +73,6 @@ while True:
 
     h, w, _ = frame.shape
 
-    # 전처리
     enhanced_frame = utils.apply_clahe(frame)
     brightness = utils.calculate_brightness(frame)
     if brightness < 50:
@@ -86,61 +86,83 @@ while True:
     
     is_phone_in_hand = False 
     is_walking = False
+    walking_mode = "NONE" # 현재 어떤 모드로 걷기를 감지 중인지 표시
     
-    # A. 걷기 감지
+    # ----------------------------------------------------
+    # A. 하이브리드 걷기 감지 (다리 우선 -> 어깨 차선)
+    # ----------------------------------------------------
     if pose_results.pose_landmarks:
         mp_drawing.draw_landmarks(enhanced_frame, pose_results.pose_landmarks, mp_pose.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
         landmarks = pose_results.pose_landmarks.landmark
-        avg_shoulder_y = (landmarks[11].y + landmarks[12].y) / 2
-        shoulder_history.append(avg_shoulder_y)
         
-        if len(shoulder_history) >= 10:
-            if (max(shoulder_history) - min(shoulder_history)) > WALKING_THRESHOLD:
-                is_walking = True
-                cv2.putText(enhanced_frame, "WALKING", (w - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            else:
-                cv2.putText(enhanced_frame, "STANDING", (w - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
+        # 🌟 1. 전신 모드 시도 (다리 분석)
+        is_full_body, leg_walking = utils.analyze_leg_movement(landmarks, w, h, ankle_history)
+        
+        if is_full_body:
+            # 하체가 보이면 다리 움직임으로 판단!
+            walking_mode = "FULL-BODY (Legs)"
+            is_walking = leg_walking
+            
+            # 시각화: 발목에 점 찍기
+            l_ankle = (int(landmarks[27].x * w), int(landmarks[27].y * h))
+            r_ankle = (int(landmarks[28].x * w), int(landmarks[28].y * h))
+            cv2.circle(enhanced_frame, l_ankle, 10, (255, 0, 255), -1)
+            cv2.circle(enhanced_frame, r_ankle, 10, (255, 0, 255), -1)
+            
+        else:
+            # 🌟 2. 상체 모드 (어깨 분석 - 기존 방식)
+            walking_mode = "UPPER-BODY (Shoulder)"
+            avg_shoulder_y = (landmarks[11].y + landmarks[12].y) / 2
+            shoulder_history.append(avg_shoulder_y)
+            
+            if len(shoulder_history) >= 10:
+                if (max(shoulder_history) - min(shoulder_history)) > WALKING_THRESHOLD_SHOULDER:
+                    is_walking = True
+        
+        # 걷기 상태 표시
+        status_text = "WALKING" if is_walking else "STANDING"
+        color = (0, 255, 0) if is_walking else (100, 100, 100)
+        cv2.putText(enhanced_frame, f"{status_text}", (w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(enhanced_frame, f"[{walking_mode}]", (w - 250, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
-    # B. 수치 계산 (화면에 띄우기 위해 미리 계산)
+    # B. 고개 숙임 감지
     current_score = 0
+    debug_info = []
     
-    # [1] Pose 기반 계산
     if pose_results.pose_landmarks:
-        # Neck
         raw_neck = utils.get_neck_angle(pose_results.pose_landmarks.landmark, w, h)
         raw_neck_diff = abs(raw_neck - base_neck)
         smooth_neck = dynamic_smooth(raw_neck_diff, smooth_neck)
-        
-        # Low Angle
+        if smooth_neck > THRESH_NECK: 
+            current_score += 1
+            debug_info.append("Neck")
+
         raw_low = utils.check_low_angle_score(pose_results.pose_landmarks.landmark, w, h)
         raw_low_diff = raw_low - base_low_angle
         smooth_low = dynamic_smooth(raw_low_diff, smooth_low)
+        if smooth_low > THRESH_LOW_ANGLE: 
+            current_score += 1
+            debug_info.append("Low")
 
-        if smooth_neck > THRESH_NECK: current_score += 1
-        if smooth_low > THRESH_LOW_ANGLE: current_score += 1
-
-    # [2] FaceMesh 기반 계산
     if face_results.multi_face_landmarks:
         for fl in face_results.multi_face_landmarks:
             mp_drawing.draw_landmarks(enhanced_frame, fl, mp_face_mesh.FACEMESH_TESSELATION, None, mp_drawing_styles.get_default_face_mesh_tesselation_style())
-
             raw_pitch, _ = utils.get_head_pose(enhanced_frame, fl.landmark)
             raw_pitch_diff = raw_pitch - base_pitch
             smooth_pitch = dynamic_smooth(raw_pitch_diff, smooth_pitch)
-            
-            if smooth_pitch > THRESH_PITCH: current_score += 1
+            if smooth_pitch > THRESH_PITCH: 
+                current_score += 1
+                debug_info.append("Pitch")
 
             if pose_results.pose_landmarks:
                 chin_dist = utils.get_chin_shoulder_distance(fl.landmark, pose_results.pose_landmarks.landmark, w, h)
                 if chin_dist < (base_chin_dist * 0.8): current_score += 1
 
-    # 🌟 [핵심] 실시간 수치 대시보드 (HUD)
-    # 기준을 넘으면 빨간색(0,0,255), 안 넘으면 초록색(0,255,0)
+    # 수치 표시 (HUD)
     color_pitch = (0, 0, 255) if smooth_pitch > THRESH_PITCH else (0, 255, 0)
     color_low = (0, 0, 255) if smooth_low > THRESH_LOW_ANGLE else (0, 255, 0)
     color_neck = (0, 0, 255) if smooth_neck > THRESH_NECK else (0, 255, 0)
 
-    # 화면 왼쪽에 출력
     cv2.putText(enhanced_frame, f"Pitch: {int(smooth_pitch)} (Limit:{THRESH_PITCH})", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_pitch, 2)
     cv2.putText(enhanced_frame, f"Low  : {int(smooth_low)} (Limit:{THRESH_LOW_ANGLE})", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_low, 2)
     cv2.putText(enhanced_frame, f"Neck : {int(smooth_neck)} (Limit:{THRESH_NECK})", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_neck, 2)
@@ -191,7 +213,7 @@ while True:
             winsound.Beep(1000, 500)
             last_beep_time = time.time()
 
-    cv2.imshow('Realtime Stat Guard', enhanced_frame)
+    cv2.imshow('Smombie Guard', enhanced_frame)
     
     key = cv2.waitKey(1)
     if key == ord('q'): break
@@ -201,9 +223,9 @@ while True:
         smooth_pitch = 0
         smooth_low = 0
         smooth_neck = 0
-        print(f"🎯 보정 완료!")
+        print(f"보정 완료")
         cv2.rectangle(enhanced_frame, (0,0), (w, h), (255, 255, 0), -1)
-        cv2.imshow('Realtime Stat Guard', enhanced_frame)
+        cv2.imshow('Smombie Guard', enhanced_frame)
         cv2.waitKey(100)
 
 cap.release()

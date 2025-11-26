@@ -127,3 +127,39 @@ def calibrate_current(frame, face_results, pose_results):
         neck_angle = get_neck_angle(pose_results.pose_landmarks.landmark, w, h)
         low_angle_score = check_low_angle_score(pose_results.pose_landmarks.landmark, w, h)
     return pitch, neck_angle, chin_ratio, low_angle_score
+
+# ... (위쪽 코드는 그대로 유지) ...
+
+# ==========================================
+# 🌟 [신규] 전신 걷기 감지 (다리 분석)
+# ==========================================
+def analyze_leg_movement(landmarks, w, h, history_deque):
+    """
+    전신이 보일 때 발목의 움직임을 분석하여 걷는지 판단.
+    history_deque: 최근 프레임의 발목 x좌표 차이를 저장할 큐
+    """
+    # 왼쪽 발목(27), 오른쪽 발목(28)
+    l_ankle = landmarks[27]
+    r_ankle = landmarks[28]
+    
+    # 1. 발목이 화면에 잘 보이는지 확인 (Visibility > 0.5)
+    if l_ankle.visibility < 0.5 or r_ankle.visibility < 0.5:
+        return False, 0 # 하체 안 보임 (상체 모드로 전환 신호)
+
+    # 2. 걷기 분석: 양쪽 발목의 X좌표 교차 확인 (앞뒤로 걷기)
+    # 걷게 되면 왼발이 앞, 오른발이 뒤 -> 반대로 바뀜.
+    # 이 '발목 사이의 거리(X축 차이)'가 주기적으로 변하는지 봐야 함.
+    
+    ankle_diff = (l_ankle.x - r_ankle.x) * w # 양 발목의 가로 거리
+    history_deque.append(ankle_diff)
+    
+    if len(history_deque) < 10: return True, False # 데이터 모으는 중
+
+    # 3. 판단 로직: 발목 간격이 넓어졌다 좁아졌다(교차) 하는지?
+    # 데이터의 분산(Variance)이나 진폭(Range)이 크면 걷는 중
+    amplitude = max(history_deque) - min(history_deque)
+    
+    # 진폭이 50픽셀 이상이면 다리를 움직이고 있다고 판단
+    is_walking = amplitude > 50 
+    
+    return True, is_walking # (전신모드 활성화 여부, 걷기 여부)
